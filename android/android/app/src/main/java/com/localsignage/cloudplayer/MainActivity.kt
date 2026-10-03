@@ -123,7 +123,20 @@ class MainActivity : AppCompatActivity() {
     private fun playerView():PlayerView{imageJob?.let{h.removeCallbacks(it)};val pv=PlayerView(this).apply{useController=false;setBackgroundColor(Color.BLACK);resizeMode=when(mode){"fill","stretch"->AspectRatioFrameLayout.RESIZE_MODE_FILL;"zoom"->AspectRatioFrameLayout.RESIZE_MODE_ZOOM;else->AspectRatioFrameLayout.RESIZE_MODE_FIT}};return pv}
     private fun showVideo(uri:String){player?.release();container.removeAllViews();val pv=playerView();container.addView(pv,FrameLayout.LayoutParams(-1,-1));val p=ExoPlayer.Builder(this).build();player=p;pv.player=p;p.addListener(object:Player.Listener{
 override fun onPlayerError(error: PlaybackException){
-    cfgText.text="LECTURE ERROR: ${error.errorCodeName} • ${error.message ?: "unknown"}"
+    var c: Throwable? = error
+    val details = StringBuilder()
+    var n = 0
+
+    while(c != null && n < 6){
+        details.append("\\n")
+            .append(c.javaClass.simpleName)
+            .append(": ")
+            .append(c.message ?: "")
+        c = c.cause
+        n++
+    }
+
+    cfgText.text = "LECTURE ERROR: ${error.errorCodeName}${details}"
 }});p.setMediaItem(hlsItem(uri));p.prepare();p.playWhenReady=true}
     private fun playVideoPlaylist(){player?.release();container.removeAllViews();val pv=playerView();container.addView(pv,FrameLayout.LayoutParams(-1,-1));val p=ExoPlayer.Builder(this).build();player=p;pv.player=p;val media=mutableListOf<MediaItem>();for(i in 0 until items.length()){val it=items.optJSONObject(i)?:continue;val u=resolve(it.optString("url"));val isHlsSource=isHls(u);val local=cacheName(u);val f=File(local);val uri=if(!isHlsSource&&f.exists()&&f.length()>0)Uri.fromFile(f).toString() else u;media.add(hlsItem(uri))};if(media.isEmpty())return;p.repeatMode=Player.REPEAT_MODE_ALL;p.addListener(object:Player.Listener{override fun onPlaybackStateChanged(st:Int){when(st){Player.STATE_BUFFERING->cfgText.text="LECTURE: buffering...";Player.STATE_READY->cfgText.text="LECTURE: OK • playlist"}}});p.setMediaItems(media,0,0);p.prepare();p.playWhenReady=true}
     private fun showImage(uri:String,d:Long){player?.release();player=null;container.removeAllViews();val iv=ImageView(this).apply{setBackgroundColor(Color.BLACK);scaleType=when(mode){"fill","zoom"->ImageView.ScaleType.CENTER_CROP;"stretch"->ImageView.ScaleType.FIT_XY;else->ImageView.ScaleType.FIT_CENTER}};container.addView(iv,FrameLayout.LayoutParams(-1,-1));try{iv.setImageURI(Uri.parse(uri))}catch(_:Exception){};imageJob=Runnable{next()};h.postDelayed(imageJob!!,d.coerceAtLeast(1)*1000)}
