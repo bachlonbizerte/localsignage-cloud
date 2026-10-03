@@ -33,7 +33,7 @@ def password_verify(password: str, stored: str) -> bool:
         return secrets.compare_digest(actual, expected)
     except Exception:
         return False
-app=FastAPI(title='LocalSignage Cloud API', version='2.3.1')
+app=FastAPI(title='LocalSignage Cloud API', version='2.3.3')
 app.mount('/media', StaticFiles(directory=MEDIA_DIR), name='media')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 clients=set()
@@ -45,7 +45,7 @@ def init_db():
     c=db()
     c.executescript('''
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS devices(id INTEGER PRIMARY KEY, device_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, platform TEXT, version TEXT, token_hash TEXT, last_seen TEXT, online INTEGER DEFAULT 0, playlist_id INTEGER, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS devices(id INTEGER PRIMARY KEY, device_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, platform TEXT, version TEXT, token_hash TEXT, last_seen TEXT, online INTEGER DEFAULT 0, playlist_id INTEGER, display_mode TEXT DEFAULT 'fit', orientation TEXT DEFAULT 'auto', created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS pair_codes(id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, expires_at TEXT NOT NULL, used INTEGER DEFAULT 0, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS media(id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, kind TEXT NOT NULL, duration REAL DEFAULT 10, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS playlists(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL);
@@ -93,11 +93,11 @@ def startup(): init_db()
 @app.get('/')
 def root(): return FileResponse(BASE/'app'/'static'/'index.html')
 @app.get('/health')
-def health(): return {'ok':True,'service':'LocalSignage Cloud','version':'2.3.1','time':now(),'timezone':'UTC (display: Africa/Tunis)'}
+def health(): return {'ok':True,'service':'LocalSignage Cloud','version':'2.3.3','time':now()}
 @app.get('/api/state')
 def state():
     c=db(); refresh_device_status(c); c.commit(); n=c.execute('SELECT COUNT(*) FROM devices').fetchone()[0]; online=c.execute('SELECT COUNT(*) FROM devices WHERE online=1').fetchone()[0]; c.close()
-    return {'version':'2.3.1','devices':n,'online':online}
+    return {'version':'2.3.3','devices':n,'online':online}
 
 @app.post('/api/auth/login')
 def login(x:Login):
@@ -129,7 +129,7 @@ def heartbeat(x:Heartbeat, authorization:str=Header(None)):
     if not d: c.close(); raise HTTPException(401,'Invalid device token')
     c.execute('UPDATE devices SET version=?,last_seen=?,online=1 WHERE device_id=?',(x.version,now(),x.device_id)); c.commit(); c.close(); return {'ok':True,'server_time':now()}
 
-OFFLINE_AFTER=90
+OFFLINE_AFTER=45
 
 def refresh_device_status(c):
     cutoff=datetime.now(timezone.utc)-timedelta(seconds=OFFLINE_AFTER)
@@ -138,7 +138,7 @@ def refresh_device_status(c):
 @app.get('/api/devices')
 def devices(_:dict=Depends(auth)):
     c=db(); refresh_device_status(c); c.commit(); rows=[]
-    for r in c.execute('SELECT id,device_id,name,platform,version,last_seen,online,playlist_id,assignment_type,media_id,live_url,live_protocol,created_at FROM devices ORDER BY id DESC'):
+    for r in c.execute('SELECT id,device_id,name,platform,version,last_seen,online,playlist_id,assignment_type,media_id,live_url,live_protocol,display_mode,orientation,created_at FROM devices ORDER BY id DESC'):
         d=dict(r)
         # Always calculate ONLINE from the heartbeat timestamp so a stale DB flag
         # can never make an old device appear online.
@@ -248,7 +248,7 @@ def player_config(device_id:str, authorization:str=Header(None)):
     elif assignment_type == 'live' and d['live_url']:
         live={'url':d['live_url'],'protocol':d['live_protocol'] or 'auto'}
     c.close()
-    return {'version':'2.3.1','device_id':device_id,'assignment_type':assignment_type,'playlist':dict(p) if p else None,'media':media,'live':live,'items':items,'display_mode':d['display_mode'] or 'fit','orientation':d['orientation'] or 'auto','server_time':now()}
+    return {'version':'2.3.3','device_id':device_id,'assignment_type':assignment_type,'playlist':dict(p) if p else None,'media':media,'live':live,'items':items,'display_mode':d['display_mode'] or 'fit','orientation':d['orientation'] or 'auto','server_time':now()}
 
 class DeviceAssignment(BaseModel):
     type: str = 'none'
@@ -264,12 +264,6 @@ def assign_device(device_id:str, x:DeviceAssignment, _:dict=Depends(auth)):
     kind=x.type.lower().strip()
     if kind not in ('none','playlist','media','live'):
         raise HTTPException(400,'Invalid assignment type')
-    mode=x.display_mode.lower().strip()
-    orient=x.orientation.lower().strip()
-    if mode not in ('fit','fill','stretch','zoom'):
-        raise HTTPException(400,'Invalid display mode')
-    if orient not in ('auto','landscape','portrait'):
-        raise HTTPException(400,'Invalid orientation')
     c=db(); d=c.execute('SELECT id FROM devices WHERE device_id=?',(device_id,)).fetchone()
     if not d:
         c.close(); raise HTTPException(404,'Device not found')
@@ -281,11 +275,18 @@ def assign_device(device_id:str, x:DeviceAssignment, _:dict=Depends(auth)):
             c.close(); raise HTTPException(404,'Media not found')
     if kind=='live' and not (x.live_url or '').strip():
         c.close(); raise HTTPException(400,'Live URL is required')
+    display_mode=x.display_mode.lower().strip()
+    orientation=x.orientation.lower().strip()
+    if display_mode not in ('fit','fill','stretch','zoom'):
+        c.close(); raise HTTPException(400,'Invalid display mode')
+    if orientation not in ('auto','landscape','portrait'):
+        c.close(); raise HTTPException(400,'Invalid orientation')
     c.execute("UPDATE devices SET assignment_type=?, playlist_id=?, media_id=?, live_url=?, live_protocol=?, display_mode=?, orientation=? WHERE device_id=?",
               (kind, x.playlist_id if kind=='playlist' else None, x.media_id if kind=='media' else None,
-               (x.live_url or '').strip() if kind=='live' else None, x.live_protocol if kind=='live' else None, mode, orient, device_id))
+               (x.live_url or '').strip() if kind=='live' else None, x.live_protocol if kind=='live' else None,
+               display_mode, orientation, device_id))
     c.commit(); c.close()
-    return {'ok':True,'device_id':device_id,'assignment_type':kind,'playlist_id':x.playlist_id if kind=='playlist' else None,'media_id':x.media_id if kind=='media' else None,'live_url':x.live_url if kind=='live' else None,'live_protocol':x.live_protocol if kind=='live' else None,'display_mode':mode,'orientation':orient}
+    return {'ok':True,'device_id':device_id,'assignment_type':kind,'playlist_id':x.playlist_id if kind=='playlist' else None,'media_id':x.media_id if kind=='media' else None,'live_url':x.live_url if kind=='live' else None,'live_protocol':x.live_protocol if kind=='live' else None,'display_mode':display_mode,'orientation':orientation}
 
 class DevicePlaylist(BaseModel):
     playlist_id: int | None = None

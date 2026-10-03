@@ -1,34 +1,107 @@
-<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LocalSignage Cloud V2.3</title><style>
-body{font-family:Arial,sans-serif;background:#0f1115;color:#eee;margin:0}header{padding:18px 28px;background:#171a21;display:flex;justify-content:space-between}main{max-width:1400px;margin:24px auto;padding:0 18px}.card{background:#191d25;border:1px solid #292f3a;border-radius:14px;padding:18px;margin-bottom:16px}input,button,select{padding:10px;border-radius:8px;border:1px solid #394150;background:#111;color:#fff}button{cursor:pointer;background:#2563eb;border:0}.danger{background:#b91c1c}.row{display:flex;gap:9px;flex-wrap:wrap}.online{color:#4ade80;font-weight:bold}.offline{color:#f87171;font-weight:bold}.muted{color:#9ca3af;font-size:13px}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid #2a303a;vertical-align:middle}.assign{display:grid;grid-template-columns:110px 220px 150px 150px auto;gap:7px;align-items:center}.assign .liveurl{min-width:230px}.pill{padding:5px 8px;border-radius:20px;background:#232936;font-size:12px}.media-item{display:flex;justify-content:space-between;align-items:center;padding:10px;border-bottom:1px solid #2a303a}@media(max-width:1000px){.assign{grid-template-columns:1fr 1fr}.assign .liveurl{min-width:0}}
-</style></head><body><header><b>LocalSignage Cloud V2.3</b><span id="who"></span></header><main>
-<div id="login" class="card"><h2>Login</h2><div class="row"><input id="user" placeholder="Username" autocomplete="username"><input id="pass" type="password" placeholder="Password" autocomplete="current-password"><button id="loginBtn">Connexion</button></div><p id="msg"></p></div>
-<div id="app" style="display:none">
-<div class="card"><h2>Pairing</h2><p>Génère un code à 6 chiffres à entrer une seule fois dans le Player. Le Player conserve ensuite son token et ne redemande pas le code après redémarrage.</p><button id="pairBtn">Générer un code</button><h1 id="code">—</h1><small id="exp"></small></div>
-<div class="card"><h2>Devices / Screens</h2><button id="refreshBtn">Actualiser</button><div id="devices" style="overflow:auto;margin-top:12px"></div></div>
-<div class="card"><h2>Media</h2><p class="muted">Vidéo/image par URL ou upload. Le Player met les médias assignés en cache local pour continuer hors ligne.</p><div class="row"><input id="mname" placeholder="Nom du média"><input id="murl" style="min-width:360px" placeholder="https://.../video.mp4"><select id="mkind"><option value="video">Video</option><option value="image">Image</option></select><input id="mdur" type="number" value="10" min="1" style="width:80px"><button id="urlBtn">Ajouter URL</button></div><div class="row" style="margin-top:10px"><input id="mfile" type="file"><button id="uploadBtn">Téléverser</button></div><div id="media"></div></div>
-<div class="card"><h2>Playlist</h2><div class="row"><input id="pname" placeholder="Nom de la playlist" value="Main Playlist"><button id="playlistBtn">Créer / remplacer</button></div><p class="muted">Les médias cochés sont lus dans l'ordre de la liste.</p><div id="playlistBuilder"></div><div id="playlists"></div></div>
-<div class="card"><h2>Cloud API</h2><p><a href="/docs">Swagger / API Docs</a></p><p id="health"></p></div>
-</div></main><script>
-(()=>{const $=id=>document.getElementById(id);let token=sessionStorage.getItem('localsignage_token')||'';const auth=()=>token?{'Authorization':'Bearer '+token}:{};
-function msg(t,good=false){$('msg').textContent=t;$('msg').className=good?'online':'offline'}
-async function api(url,opt={}){const r=await fetch(url,{...opt,headers:{...(opt.headers||{}),...auth()}});let j={};try{j=await r.json()}catch(e){j={detail:'Réponse invalide HTTP '+r.status}}if(!r.ok)throw Error(j.detail||'HTTP '+r.status);return j}
-async function doLogin(){const u=$('user').value.trim(),p=$('pass').value;if(!u||!p){msg('Saisis les credentials.');return}msg('Connexion...');try{const j=await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});token=j.access_token;sessionStorage.setItem('localsignage_token',token);$('login').style.display='none';$('app').style.display='block';$('who').textContent=u;loadAll()}catch(e){msg('Erreur login: '+e.message)}}
-function dt(x){if(!x)return'-';try{return new Intl.DateTimeFormat('fr-TN',{timeZone:'Africa/Tunis',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date(x))}catch(e){return x}}
-async function pair(){try{const j=await api('/api/devices/pair/start',{method:'POST'});$('code').textContent=j.code;$('exp').textContent='Expire: '+dt(j.expires_at)+' (Tunisie)'}catch(e){alert(e.message)}}
-function safe(x){return String(x).replace(/[^a-zA-Z0-9]/g,'_')}
-function assignControls(d,pls,med){const sid=safe(d.device_id),type=d.assignment_type||'none';let target='';if(type==='playlist')target='<select id="sel-'+sid+'"><option value="">-- Playlist --</option>'+pls.map(p=>`<option value="${p.id}">${p.name}</option>`).join('')+'</select>';else if(type==='media')target='<select id="sel-'+sid+'"><option value="">-- Média --</option>'+med.map(m=>`<option value="${m.id}">${m.name} [${m.kind}]</option>`).join('')+'</select>';else if(type==='live')target='<input class="liveurl" id="live-'+sid+'" value="'+(d.live_url||'').replaceAll('"','&quot;')+'" placeholder="URL live"><select id="proto-'+sid+'"><option value="auto">Auto</option><option value="hls">HLS</option><option value="rtsp">RTSP</option><option value="rtmp">RTMP</option></select>';else target='<span class="muted">Aucun contenu</span>';
-return `<div class="assign"><select id="at-${sid}" onchange="window.changeAssign('${d.device_id}')"><option value="none" ${type==='none'?'selected':''}>Aucun</option><option value="playlist" ${type==='playlist'?'selected':''}>Playlist</option><option value="media" ${type==='media'?'selected':''}>Media</option><option value="live" ${type==='live'?'selected':''}>Live</option></select><span id="target-${sid}">${target}</span><select id="mode-${sid}"><option value="fit" ${(d.display_mode||'fit')==='fit'?'selected':''}>Fit</option><option value="fill" ${(d.display_mode||'fit')==='fill'?'selected':''}>Fill</option><option value="stretch" ${(d.display_mode||'fit')==='stretch'?'selected':''}>Étiré</option><option value="zoom" ${(d.display_mode||'fit')==='zoom'?'selected':''}>Zoom</option></select><select id="ori-${sid}"><option value="auto" ${(d.orientation||'auto')==='auto'?'selected':''}>Auto</option><option value="landscape" ${(d.orientation||'auto')==='landscape'?'selected':''}>Landscape</option><option value="portrait" ${(d.orientation||'auto')==='portrait'?'selected':''}>Portrait</option></select><button id="btn-${sid}" onclick="window.assign('${d.device_id}')">Assigner</button></div>`}
-async function loadDevices(){try{const [ds,ps,ms]=await Promise.all([api('/api/devices'),api('/api/playlists'),api('/api/media')]);let rows=ds.map(d=>`<tr><td>${d.device_id}</td><td>${d.name}</td><td>${d.platform}</td><td>${d.version}</td><td class="${d.online?'online':'offline'}">${d.online?'ONLINE':'OFFLINE'}</td><td>${dt(d.last_seen)}</td><td>${assignControls(d,ps,ms)}</td><td><button class="danger" onclick="window.delDevice('${d.device_id}')">Supprimer</button></td></tr>`).join('');$('devices').innerHTML='<table><tr><th>Device</th><th>Nom</th><th>Platform</th><th>Version</th><th>Etat</th><th>Dernier heartbeat (Tunisie)</th><th>Assignation + affichage</th><th></th></tr>'+rows+'</table><p class="muted">ONLINE après heartbeat récent (&lt; 90 s). Affichage: Fit / Fill / Étiré / Zoom + Auto / Landscape / Portrait.</p>';ds.forEach(d=>{const sid=safe(d.device_id);if(d.assignment_type==='playlist'&&d.playlist_id!=null)$('sel-'+sid).value=String(d.playlist_id);if(d.assignment_type==='media'&&d.media_id!=null)$('sel-'+sid).value=String(d.media_id);if(d.assignment_type==='live')$('proto-'+sid).value=d.live_protocol||'auto'})}catch(e){$('devices').innerHTML='<p class="offline">Erreur: '+e.message+'</p>'}}
-window.changeAssign=async id=>{const sid=safe(id),type=$('at-'+sid).value,target=$('target-'+sid);let h='';if(type==='playlist'){const ps=await api('/api/playlists');h='<select id="sel-'+sid+'"><option value="">-- Playlist --</option>'+ps.map(p=>`<option value="${p.id}">${p.name}</option>`).join('')+'</select>'}else if(type==='media'){const ms=await api('/api/media');h='<select id="sel-'+sid+'"><option value="">-- Média --</option>'+ms.map(m=>`<option value="${m.id}">${m.name} [${m.kind}]</option>`).join('')+'</select>'}else if(type==='live')h='<input class="liveurl" id="live-'+sid+'" placeholder="URL live"><select id="proto-'+sid+'"><option value="auto">Auto</option><option value="hls">HLS</option><option value="rtsp">RTSP</option><option value="rtmp">RTMP</option></select>';else h='<span class="muted">Aucun contenu</span>';target.innerHTML=h}
-window.assign=async id=>{try{const sid=safe(id),type=$('at-'+sid).value,p={type,display_mode:$('mode-'+sid).value,orientation:$('ori-'+sid).value};if(type==='playlist'){p.playlist_id=Number($('sel-'+sid).value);if(!p.playlist_id)throw Error('Choisis une playlist')}if(type==='media'){p.media_id=Number($('sel-'+sid).value);if(!p.media_id)throw Error('Choisis un média')}if(type==='live'){p.live_url=$('live-'+sid).value.trim();p.live_protocol=$('proto-'+sid).value;if(!p.live_url)throw Error('Saisis une URL live')}const btn=$('btn-'+sid); if(btn){btn.disabled=true;btn.textContent='Enregistrement...'}; await api('/api/devices/'+encodeURIComponent(id)+'/assignment',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)}); if(btn){btn.textContent='✓ Assigné';setTimeout(()=>{btn.disabled=false;btn.textContent='Assigner'},1200)}; loadDevices()}catch(e){const btn=$('btn-'+sid);if(btn){btn.disabled=false;btn.textContent='Assigner'};alert('Assignation: '+e.message)}};
-window.delDevice=async id=>{if(confirm('Supprimer ce device ?')){await api('/api/devices/'+encodeURIComponent(id),{method:'DELETE'});loadDevices()}}
-async function loadMedia(){const a=await api('/api/media');$('media').innerHTML=a.length?a.map(m=>`<div class="media-item"><span><b>${m.name}</b> <span class="muted">[${m.kind}] ${m.duration}s</span><br><span class="muted">${m.url}</span></span><button class="danger" onclick="window.delMedia(${m.id})">Supprimer</button></div>`).join(''):'<p class="muted">Aucun média.</p>';$('playlistBuilder').innerHTML=a.map(m=>`<label style="display:block;padding:7px"><input type="checkbox" class="mid" value="${m.id}"> ${m.name} <span class="muted">(${m.kind})</span></label>`).join('')}
-window.delMedia=async id=>{await api('/api/media/'+id,{method:'DELETE'});loadAll()};$('urlBtn').onclick=async()=>{try{await api('/api/media',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('mname').value||$('murl').value,url:$('murl').value,kind:$('mkind').value,duration:Number($('mdur').value)||10})});loadMedia()}catch(e){alert(e.message)}};
-$('uploadBtn').onclick=async()=>{try{const f=$('mfile').files[0];if(!f)return;const fd=new FormData();fd.append('file',f);fd.append('name',$('mname').value||f.name);fd.append('kind',$('mkind').value);fd.append('duration',$('mdur').value);await api('/api/media/upload',{method:'POST',body:fd});loadMedia()}catch(e){alert(e.message)}};
-$('playlistBtn').onclick=async()=>{try{const ids=[...document.querySelectorAll('.mid:checked')].map(x=>Number(x.value)),name=$('pname').value.trim()||'Main Playlist',ps=await api('/api/playlists'),old=ps.find(x=>x.name===name);await api(old?'/api/playlists/'+old.id:'/api/playlists',{method:old?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_ids:ids})});loadPlaylists()}catch(e){alert(e.message)}};
-async function loadPlaylists(){const a=await api('/api/playlists');$('playlists').innerHTML=a.map(p=>`<div class="media-item"><span><b>${p.name}</b> — ${p.items.length} média(s)<br><span class="muted">${p.items.map(i=>i.name).join(' → ')||'vide'}</span></span></div>`).join('')||'<p class="muted">Aucune playlist.</p>'}
-async function health(){try{const j=await fetch('/health').then(r=>r.json());$('health').textContent='API OK · '+j.version+' · affichage Africa/Tunis'}catch(e){$('health').textContent='API indisponible'}}
-function loadAll(){loadDevices();loadMedia();loadPlaylists();health();if(!window.timer)window.timer=setInterval(loadDevices,10000)}
-$('loginBtn').onclick=doLogin;$('pairBtn').onclick=pair;$('refreshBtn').onclick=loadDevices;$('pass').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});
-addEventListener('DOMContentLoaded',()=>{if(token)api('/api/devices').then(()=>{$('login').style.display='none';$('app').style.display='block';$('who').textContent='Session';loadAll()}).catch(()=>{sessionStorage.removeItem('localsignage_token');token=''})})
-})();</script></body></html>
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>LocalSignage Cloud</title><style>body{font-family:Arial;background:#0f1115;color:#eee;margin:0}header{padding:20px 28px;background:#171a21;display:flex;justify-content:space-between}main{max-width:1150px;margin:25px auto;padding:0 20px}.card{background:#191d25;border:1px solid #292f3a;border-radius:14px;padding:20px;margin-bottom:18px}input,button,select{padding:11px;border-radius:8px;border:1px solid #394150;background:#111;color:#fff}button{cursor:pointer;background:#2563eb;border:0}.danger{background:#b91c1c}.row{display:flex;gap:10px;flex-wrap:wrap}.status{font-weight:bold}.online{color:#4ade80}.offline{color:#f87171}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px;border-bottom:1px solid #2a303a}a{color:#60a5fa}.media-item{display:flex;justify-content:space-between;align-items:center;padding:10px;border-bottom:1px solid #2a303a}.muted{color:#9ca3af;font-size:13px}.assign{display:flex;gap:8px;align-items:center}.assign select{min-width:190px}</style></head><body><header><b>LocalSignage Cloud V2.3.3</b><span id="who"></span></header><main><div id="login" class="card"><h2>Login</h2><div class="row"><input id="user" placeholder="Username"><input id="pass" type="password" placeholder="Password"><button onclick="doLogin()">Connexion</button></div><p id="msg"></p></div><div id="app" style="display:none"><div class="card"><h2>Pairing</h2><p>Génère un code de 6 chiffres à entrer dans le Player Android.</p><button onclick="pairCode()">Générer un code</button><h1 id="code"></h1><small id="exp"></small></div><div class="card"><h2>Devices</h2><button onclick="refreshDeviceStatuses()">Actualiser statut</button><div id="devices"></div></div><div class="card"><h2>Media</h2><p class="muted">Ajoute une vidéo/image par URL, ou téléverse un fichier.</p><div class="row"><input id="mname" placeholder="Nom du média"><input id="murl" style="min-width:360px" placeholder="https://.../video.mp4"><select id="mkind"><option value="video">Video</option><option value="image">Image</option></select><input id="mdur" type="number" value="10" min="1" style="width:80px"><button onclick="addUrlMedia()">Ajouter URL</button></div><div class="row" style="margin-top:10px"><input id="mfile" type="file"><button onclick="uploadMedia()">Téléverser</button></div><div id="media"></div></div><div class="card"><h2>Playlist</h2><div class="row"><input id="pname" placeholder="Nom de la playlist" value="Main Playlist"><button onclick="createPlaylist()">Créer / remplacer</button></div><p class="muted">Les médias cochés seront lus dans l'ordre affiché.</p><div id="playlistBuilder"></div><div id="playlists"></div></div><div class="card"><h2>Cloud API</h2><p><a href="/docs">Ouvrir Swagger / API Docs</a></p><p id="health"></p></div></div></main><script>
+(function(){
+'use strict';
+let tk=sessionStorage.getItem('localsignage_token')||'';
+const $=id=>document.getElementById(id);
+const H=()=>tk?{Authorization:'Bearer '+tk}:{};
+function setMsg(t,ok=false){const e=$('msg'); if(e){e.textContent=t;e.className=ok?'online':'offline';}}
+async function api(url,opts={}){
+  const r=await fetch(url,{...opts,headers:{...(opts.headers||{}),...(tk?H():{})}});
+  let j=null; try{j=await r.json()}catch(_){j={detail:'Réponse serveur invalide ('+r.status+')'}}
+  if(!r.ok) throw new Error(j.detail||('HTTP '+r.status));
+  return j;
+}
+async function doLogin(){
+  const username=($('user')?.value||'').trim();
+  const password=$('pass')?.value||'';
+  if(!username||!password){setMsg('Veuillez saisir utilisateur et mot de passe.');return;}
+  setMsg('Connexion au serveur...');
+  try{
+    const j=await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,password})});
+    if(!j.access_token) throw new Error('Token de connexion manquant');
+    tk=j.access_token; sessionStorage.setItem('localsignage_token',tk);
+    showApp(username); setMsg('',true);
+  }catch(e){setMsg('Erreur login: '+e.message);console.error('LOGIN',e);}
+}
+function showApp(username){$('login').style.display='none';$('app').style.display='block';$('who').textContent=username||'admin';loadAll();}
+async function pairCode(){try{const j=await api('/api/devices/pair/start',{method:'POST'});$('code').textContent=j.code;$('exp').textContent='Expire: '+formatDateTime(j.expires_at)+' (heure Tunisie)';}catch(e){alert('Pairing: '+e.message)}}
+function formatDateTime(iso){if(!iso)return '-';const d=new Date(iso);if(Number.isNaN(d.getTime()))return iso;return new Intl.DateTimeFormat('fr-TN',{timeZone:'Africa/Tunis',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(d)}
+async function loadDevices(){
+  try{
+    const [a,pls,med]=await Promise.all([api('/api/devices'),api('/api/playlists'),api('/api/media')]);
+    window._lsDevices=a;
+    const safe=id=>String(id).replace(/[^a-zA-Z0-9]/g,'_');
+    const rows=a.map(d=>{
+      const sid=safe(d.device_id);
+      const type=d.assignment_type||((d.playlist_id!=null)?'playlist':'none');
+      let target='';
+      if(type==='live') target=`<input id="live-${sid}" value="${(d.live_url||'').replace(/"/g,'&quot;')}" placeholder="URL live" style="min-width:240px"><select id="proto-${sid}"><option value="auto">Auto</option><option value="hls">HLS</option><option value="rtsp">RTSP</option><option value="rtmp">RTMP</option><option value="srt">SRT</option></select>`;
+      else if(type==='playlist') target='<select id="sel-'+sid+'" style="min-width:210px"><option value="">-- Choisir playlist --</option>'+pls.map(x=>`<option value="${x.id}">${x.name}</option>`).join('')+'</select>';
+      else if(type==='media') target='<select id="sel-'+sid+'" style="min-width:210px"><option value="">-- Choisir média --</option>'+med.map(x=>`<option value="${x.id}">${x.name} [${x.kind}]</option>`).join('')+'</select>';
+      else target='<span class="muted">Aucun contenu</span>';
+      return `<tr data-device-row="${sid}"><td>${d.device_id}</td><td>${d.name}</td><td>${d.platform}</td><td>${d.version||'-'}</td><td class="status-cell ${d.online?'online':'offline'}">${d.online?'ONLINE':'OFFLINE'}</td><td class="seen-cell">${formatDateTime(d.last_seen)}</td><td><div class="assign"><select id="at-${sid}" onchange="assignmentChanged('${d.device_id}')"><option value="none" ${type==='none'?'selected':''}>Aucun</option><option value="playlist" ${type==='playlist'?'selected':''}>Playlist</option><option value="media" ${type==='media'?'selected':''}>Media</option><option value="live" ${type==='live'?'selected':''}>Live</option></select><span id="target-${sid}">${target}</span><select id="mode-${sid}" title="Mode d'affichage"><option value="fit">Fit</option><option value="fill">Fill</option><option value="stretch">Étiré</option><option value="zoom">Zoom</option></select><select id="ori-${sid}" title="Orientation"><option value="auto">Auto</option><option value="landscape">Landscape</option><option value="portrait">Portrait</option></select><button onclick="assignAssignment('${d.device_id}')">Assigner</button></div></td><td><button class="danger" onclick="delDevice('${d.device_id}')">Supprimer</button></td></tr>`;
+    }).join('');
+    $('devices').innerHTML='<table><tr><th>Device</th><th>Nom</th><th>Platform</th><th>Version</th><th>Etat</th><th>Dernier heartbeat (Tunisie)</th><th>Assignation écran</th><th></th></tr>'+rows+'</table><p class="muted">Actualisation du statut toutes les 10 secondes sans reconstruire les commandes. Tu peux prendre ton temps pour choisir.</p>';
+    a.forEach(d=>{
+      const sid=safe(d.device_id);
+      if(d.assignment_type==='playlist'&&d.playlist_id!=null){const e=$('sel-'+sid);if(e)e.value=String(d.playlist_id)}
+      if(d.assignment_type==='media'&&d.media_id!=null){const e=$('sel-'+sid);if(e)e.value=String(d.media_id)}
+      if(d.assignment_type==='live'){if($('proto-'+sid))$('proto-'+sid).value=d.live_protocol||'auto';if($('live-'+sid))$('live-'+sid).value=d.live_url||''}
+      if($('mode-'+sid))$('mode-'+sid).value=d.display_mode||'fit';
+      if($('ori-'+sid))$('ori-'+sid).value=d.orientation||'auto';
+    });
+  }catch(e){console.error(e);$('devices').innerHTML='<p class="offline">Erreur: '+e.message+'</p>';}
+}
+async function refreshDeviceStatuses(){
+  try{
+    const a=await api('/api/devices');
+    const safe=id=>String(id).replace(/[^a-zA-Z0-9]/g,'_');
+    a.forEach(d=>{
+      const row=document.querySelector('[data-device-row="'+safe(d.device_id)+'"]');
+      if(!row)return;
+      const st=row.querySelector('.status-cell');
+      const seen=row.querySelector('.seen-cell');
+      if(st){st.className='status-cell '+(d.online?'online':'offline');st.textContent=d.online?'ONLINE':'OFFLINE'}
+      if(seen)seen.textContent=formatDateTime(d.last_seen);
+    });
+    window._lsDevices=a;
+  }catch(e){console.warn('status refresh',e)}
+}
+function assignmentChanged(deviceId){
+  const sid=String(deviceId).replace(/[^a-zA-Z0-9]/g,'_');
+  const type=$('at-'+sid)?.value;
+  let html='';
+  const pls=(window._lsPlaylists||[]), med=(window._lsMedia||[]);
+  if(type==='playlist') html='<select id="sel-'+sid+'" style="min-width:210px"><option value="">-- Choisir playlist --</option>'+pls.map(x=>`<option value="${x.id}">${x.name}</option>`).join('')+'</select>';
+  else if(type==='media') html='<select id="sel-'+sid+'" style="min-width:210px"><option value="">-- Choisir média --</option>'+med.map(x=>`<option value="${x.id}">${x.name} [${x.kind}]</option>`).join('')+'</select>';
+  else if(type==='live') html='<input id="live-'+sid+'" placeholder="URL live" style="min-width:240px"><select id="proto-'+sid+'"><option value="auto">Auto</option><option value="hls">HLS</option><option value="rtsp">RTSP</option><option value="rtmp">RTMP</option><option value="srt">SRT</option></select>';
+  else html='<span class="muted">Aucun contenu</span>';
+  $('target-'+sid).innerHTML=html;
+}
+async function assignAssignment(deviceId){
+  try{
+    const sid=String(deviceId).replace(/[^a-zA-Z0-9]/g,'_');
+    const type=$('at-'+sid).value; const payload={type,display_mode:$('mode-'+sid)?.value||'fit',orientation:$('ori-'+sid)?.value||'auto'};
+    if(type==='playlist'){payload.playlist_id=Number($('sel-'+sid).value);if(!payload.playlist_id)throw new Error('Choisis une playlist')}
+    if(type==='media'){payload.media_id=Number($('sel-'+sid).value);if(!payload.media_id)throw new Error('Choisis un média')}
+    if(type==='live'){payload.live_url=($('live-'+sid)?.value||'').trim();payload.live_protocol=$('proto-'+sid)?.value||'auto';if(!payload.live_url)throw new Error('Saisis une URL live')}
+    const btn=document.querySelector('[data-device-row="'+sid+'"] button:not(.danger)');if(btn)btn.disabled=true;
+    const r=await api('/api/devices/'+encodeURIComponent(deviceId)+'/assignment',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    if(btn)btn.disabled=false;
+    alert('Assignation enregistrée: '+r.assignment_type);
+    await loadDevices();
+  }catch(e){alert('Assignation: '+e.message);const b=document.querySelector('[data-device-row="'+String(deviceId).replace(/[^a-zA-Z0-9]/g,'_')+'"] button:not(.danger)');if(b)b.disabled=false}
+}
+async function delDevice(id){try{await api('/api/devices/'+encodeURIComponent(id),{method:'DELETE'});loadDevices()}catch(e){alert(e.message)}}
+async function loadMedia(){try{const a=await api('/api/media');window._lsMedia=a;$('media').innerHTML=a.length?a.map(m=>`<div class="media-item"><span><b>${m.name}</b> <span class="muted">[${m.kind}] ${m.duration}s</span><br><span class="muted">${m.url}</span></span><button class="danger" onclick="delMedia(${m.id})">Supprimer</button></div>`).join(''):'<p class="muted">Aucun média.</p>';$('playlistBuilder').innerHTML=a.map(m=>`<label style="display:block;padding:7px"><input type="checkbox" class="mid" value="${m.id}"> ${m.name} <span class="muted">(${m.kind})</span></label>`).join('')}catch(e){console.error(e)}}
+async function addUrlMedia(){try{if(!$('murl').value)return;await api('/api/media',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('mname').value||$('murl').value,url:$('murl').value,kind:$('mkind').value,duration:Number($('mdur').value)||10})});$('mname').value='';$('murl').value='';loadMedia()}catch(e){alert(e.message)}}
+async function uploadMedia(){try{const f=$('mfile').files[0];if(!f)return;const fd=new FormData();fd.append('file',f);fd.append('name',$('mname').value||f.name);fd.append('kind',$('mkind').value);fd.append('duration',$('mdur').value);await api('/api/media/upload',{method:'POST',body:fd});$('mfile').value='';$('mname').value='';loadMedia()}catch(e){alert(e.message)}}
+async function delMedia(id){try{await api('/api/media/'+id,{method:'DELETE'});loadAll()}catch(e){alert(e.message)}}
+async function createPlaylist(){try{const ids=[...document.querySelectorAll('.mid:checked')].map(x=>Number(x.value));const name=$('pname').value.trim()||'Main Playlist';const existing=await api('/api/playlists');const old=existing.find(x=>x.name===name);await api(old?'/api/playlists/'+old.id:'/api/playlists',{method:old?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_ids:ids})});loadPlaylists()}catch(e){alert(e.message)}}
+async function loadPlaylists(){try{const a=await api('/api/playlists');window._lsPlaylists=a;$('playlists').innerHTML=a.length?a.map(p=>`<div class="media-item"><span><b>${p.name}</b> — ${p.items.length} média(s)<br><span class="muted">${p.items.map(i=>i.name).join(' → ')||'vide'}</span></span></div>`).join(''):'<p class="muted">Aucune playlist.</p>'}catch(e){console.error(e)}}
+async function checkHealth(){try{const j=await fetch('/health').then(r=>r.json());$('health').textContent='API OK · '+j.version}catch(e){$('health').textContent='API indisponible'}}
+function loadAll(){Promise.all([loadMedia(),loadPlaylists()]).then(()=>loadDevices());checkHealth();if(!window._lsTimer)window._lsTimer=setInterval(refreshDeviceStatuses,10000)}
+window.doLogin=doLogin;window.pairCode=pairCode;window.loadDevices=loadDevices;window.assignmentChanged=assignmentChanged;window.assignAssignment=assignAssignment;window.delDevice=delDevice;window.addUrlMedia=addUrlMedia;window.uploadMedia=uploadMedia;window.delMedia=delMedia;window.createPlaylist=createPlaylist;
+window.addEventListener('DOMContentLoaded',()=>{if(tk){api('/api/devices').then(()=>showApp('admin')).catch(()=>{sessionStorage.removeItem('localsignage_token');tk='';});}});
+})();
+</script></body></html>
