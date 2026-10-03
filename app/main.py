@@ -33,7 +33,7 @@ def password_verify(password: str, stored: str) -> bool:
         return secrets.compare_digest(actual, expected)
     except Exception:
         return False
-app=FastAPI(title='LocalSignage Cloud API', version='2.1.0')
+app=FastAPI(title='LocalSignage Cloud API', version='2.2.0')
 app.mount('/media', StaticFiles(directory=MEDIA_DIR), name='media')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 clients=set()
@@ -55,6 +55,16 @@ def init_db():
     cols={r['name'] for r in c.execute('PRAGMA table_info(devices)')}
     if 'playlist_id' not in cols:
         c.execute('ALTER TABLE devices ADD COLUMN playlist_id INTEGER')
+    if 'assignment_type' not in cols:
+        c.execute("ALTER TABLE devices ADD COLUMN assignment_type TEXT DEFAULT 'playlist'")
+    if 'media_id' not in cols:
+        c.execute('ALTER TABLE devices ADD COLUMN media_id INTEGER')
+    if 'live_url' not in cols:
+        c.execute('ALTER TABLE devices ADD COLUMN live_url TEXT')
+    if 'live_protocol' not in cols:
+        c.execute('ALTER TABLE devices ADD COLUMN live_protocol TEXT')
+    c.execute("UPDATE devices SET assignment_type='playlist' WHERE playlist_id IS NOT NULL")
+    c.execute("UPDATE devices SET assignment_type='none' WHERE playlist_id IS NULL AND media_id IS NULL AND (live_url IS NULL OR live_url='')")
     if not c.execute('SELECT 1 FROM users WHERE username=?',(ADMIN_USER,)).fetchone():
         c.execute('INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)',(ADMIN_USER,password_hash(ADMIN_PASSWORD),now()))
     c.commit(); c.close()
@@ -79,11 +89,11 @@ def startup(): init_db()
 @app.get('/')
 def root(): return FileResponse(BASE/'app'/'static'/'index.html')
 @app.get('/health')
-def health(): return {'ok':True,'service':'LocalSignage Cloud','version':'2.1.0','time':now()}
+def health(): return {'ok':True,'service':'LocalSignage Cloud','version':'2.2.0','time':now()}
 @app.get('/api/state')
 def state():
     c=db(); refresh_device_status(c); c.commit(); n=c.execute('SELECT COUNT(*) FROM devices').fetchone()[0]; online=c.execute('SELECT COUNT(*) FROM devices WHERE online=1').fetchone()[0]; c.close()
-    return {'version':'2.1.0','devices':n,'online':online}
+    return {'version':'2.2.0','devices':n,'online':online}
 
 @app.post('/api/auth/login')
 def login(x:Login):
@@ -124,7 +134,7 @@ def refresh_device_status(c):
 @app.get('/api/devices')
 def devices(_:dict=Depends(auth)):
     c=db(); refresh_device_status(c); c.commit(); rows=[]
-    for r in c.execute('SELECT id,device_id,name,platform,version,last_seen,online,playlist_id,created_at FROM devices ORDER BY id DESC'):
+    for r in c.execute('SELECT id,device_id,name,platform,version,last_seen,online,playlist_id,assignment_type,media_id,live_url,live_protocol,created_at FROM devices ORDER BY id DESC'):
         d=dict(r)
         # Always calculate ONLINE from the heartbeat timestamp so a stale DB flag
         # can never make an old device appear online.
@@ -217,32 +227,60 @@ def device_auth(authorization: str=Header(None)):
 
 @app.get('/api/player/config')
 def player_config(device_id:str, authorization:str=Header(None)):
-    t=device_auth(authorization); c=db(); d=c.execute('SELECT * FROM devices WHERE device_id=? AND token_hash=?',(device_id,hash_token(t))).fetchone()
-    if not d: c.close(); raise HTTPException(401,'Invalid device token')
-    refresh_device_status(c)
-    p=None
-    if d['playlist_id'] is not None:
+    t=device_auth(authorization)
+    c=db(); d=c.execute('SELECT * FROM devices WHERE device_id=? AND token_hash=?',(device_id,hash_token(t))).fetchone()
+    if not d:
+        c.close(); raise HTTPException(401,'Invalid device token')
+    assignment_type=d['assignment_type'] or ('playlist' if d['playlist_id'] is not None else 'none')
+    p=None; items=[]; media=None; live=None
+    if assignment_type == 'playlist' and d['playlist_id'] is not None:
         p=c.execute('SELECT * FROM playlists WHERE id=?',(d['playlist_id'],)).fetchone()
-    items=[]
-    if p:
-        items=[dict(r) for r in c.execute('SELECT pi.id,pi.media_id,pi.position,pi.duration,m.name,m.url,m.kind FROM playlist_items pi JOIN media m ON m.id=pi.media_id WHERE pi.playlist_id=? ORDER BY pi.position',(p['id'],))]
+        if p:
+            items=[dict(r) for r in c.execute('SELECT pi.id,pi.media_id,pi.position,pi.duration,m.name,m.url,m.kind FROM playlist_items pi JOIN media m ON m.id=pi.media_id WHERE pi.playlist_id=? ORDER BY pi.position',(p['id'],))]
+    elif assignment_type == 'media' and d['media_id'] is not None:
+        media_row=c.execute('SELECT * FROM media WHERE id=?',(d['media_id'],)).fetchone()
+        if media_row:
+            media=dict(media_row); items=[media]
+    elif assignment_type == 'live' and d['live_url']:
+        live={'url':d['live_url'],'protocol':d['live_protocol'] or 'auto'}
     c.close()
-    return {'version':'2.1.1','device_id':device_id,'playlist':dict(p) if p else None,'items':items,'server_time':now()}
+    return {'version':'2.2.0','device_id':device_id,'assignment_type':assignment_type,'playlist':dict(p) if p else None,'media':media,'live':live,'items':items,'server_time':now()}
+
+class DeviceAssignment(BaseModel):
+    type: str = 'none'
+    playlist_id: int | None = None
+    media_id: int | None = None
+    live_url: str | None = None
+    live_protocol: str | None = None
+
+@app.put('/api/devices/{device_id}/assignment')
+def assign_device(device_id:str, x:DeviceAssignment, _:dict=Depends(auth)):
+    kind=x.type.lower().strip()
+    if kind not in ('none','playlist','media','live'):
+        raise HTTPException(400,'Invalid assignment type')
+    c=db(); d=c.execute('SELECT id FROM devices WHERE device_id=?',(device_id,)).fetchone()
+    if not d:
+        c.close(); raise HTTPException(404,'Device not found')
+    if kind=='playlist':
+        if x.playlist_id is None or not c.execute('SELECT id FROM playlists WHERE id=?',(x.playlist_id,)).fetchone():
+            c.close(); raise HTTPException(404,'Playlist not found')
+    if kind=='media':
+        if x.media_id is None or not c.execute('SELECT id FROM media WHERE id=?',(x.media_id,)).fetchone():
+            c.close(); raise HTTPException(404,'Media not found')
+    if kind=='live' and not (x.live_url or '').strip():
+        c.close(); raise HTTPException(400,'Live URL is required')
+    c.execute("UPDATE devices SET assignment_type=?, playlist_id=?, media_id=?, live_url=?, live_protocol=? WHERE device_id=?",
+              (kind, x.playlist_id if kind=='playlist' else None, x.media_id if kind=='media' else None,
+               (x.live_url or '').strip() if kind=='live' else None, x.live_protocol if kind=='live' else None, device_id))
+    c.commit(); c.close()
+    return {'ok':True,'device_id':device_id,'assignment_type':kind,'playlist_id':x.playlist_id if kind=='playlist' else None,'media_id':x.media_id if kind=='media' else None,'live_url':x.live_url if kind=='live' else None,'live_protocol':x.live_protocol if kind=='live' else None}
 
 class DevicePlaylist(BaseModel):
     playlist_id: int | None = None
 
 @app.put('/api/devices/{device_id}/playlist')
-def assign_device_playlist(device_id:str, x:DevicePlaylist, _:dict=Depends(auth)):
-    c=db()
-    d=c.execute('SELECT id FROM devices WHERE device_id=?',(device_id,)).fetchone()
-    if not d:
-        c.close(); raise HTTPException(404,'Device not found')
-    if x.playlist_id is not None and not c.execute('SELECT id FROM playlists WHERE id=?',(x.playlist_id,)).fetchone():
-        c.close(); raise HTTPException(404,'Playlist not found')
-    c.execute('UPDATE devices SET playlist_id=? WHERE device_id=?',(x.playlist_id,device_id))
-    c.commit(); c.close()
-    return {'ok':True,'device_id':device_id,'playlist_id':x.playlist_id}
+def assign_device_playlist_compat(device_id:str, x:DevicePlaylist, _:dict=Depends(auth)):
+    return assign_device(device_id, DeviceAssignment(type='playlist' if x.playlist_id is not None else 'none', playlist_id=x.playlist_id), _)
 
 @app.delete('/api/devices/{device_id}')
 def delete_device(device_id:str, _:dict=Depends(auth)):
