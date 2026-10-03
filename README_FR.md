@@ -30,3 +30,7 @@ Cela donne une URL temporaire `trycloudflare.com`. C'est prévu pour développem
 - `DELETE /api/devices/{device_id}` (admin)
 - `WS /ws/dashboard`
 - `GET /health`
+
+
+### V2.0.1 Render
+Cette version utilise PBKDF2-HMAC-SHA256 pour les mots de passe et ne dépend plus de Passlib/bcrypt, afin d’éviter les incompatibilités observées sur Python 3.14 de Render.

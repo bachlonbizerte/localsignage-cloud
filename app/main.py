@@ -6,7 +6,6 @@ from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocke
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from passlib.context import CryptContext
 
 BASE=Path(__file__).resolve().parent.parent
 DB=Path(os.getenv('DB_PATH', BASE/'data'/'localsignage.db'))
@@ -14,8 +13,24 @@ DB.parent.mkdir(parents=True, exist_ok=True)
 SECRET=os.getenv('JWT_SECRET','CHANGE_ME_LOCALSIGNAGE_SECRET')
 ADMIN_USER=os.getenv('ADMIN_USER','admin')
 ADMIN_PASSWORD=os.getenv('ADMIN_PASSWORD','admin123!')
-pwd=CryptContext(schemes=['bcrypt'], deprecated='auto')
-app=FastAPI(title='LocalSignage Cloud API', version='2.0.0')
+PBKDF2_ITERATIONS=600_000
+
+def password_hash(password: str) -> str:
+    salt=secrets.token_bytes(16)
+    digest=hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, PBKDF2_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+def password_verify(password: str, stored: str) -> bool:
+    try:
+        scheme,iters,salt_hex,digest_hex=stored.split('$',3)
+        if scheme != 'pbkdf2_sha256': return False
+        salt=bytes.fromhex(salt_hex)
+        expected=bytes.fromhex(digest_hex)
+        actual=hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, int(iters))
+        return secrets.compare_digest(actual, expected)
+    except Exception:
+        return False
+app=FastAPI(title='LocalSignage Cloud API', version='2.0.1')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 clients=set()
 
@@ -30,7 +45,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS pair_codes(id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, expires_at TEXT NOT NULL, used INTEGER DEFAULT 0, created_at TEXT NOT NULL);
     ''')
     if not c.execute('SELECT 1 FROM users WHERE username=?',(ADMIN_USER,)).fetchone():
-        c.execute('INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)',(ADMIN_USER,pwd.hash(ADMIN_PASSWORD),now()))
+        c.execute('INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)',(ADMIN_USER,password_hash(ADMIN_PASSWORD),now()))
     c.commit(); c.close()
 
 def now(): return datetime.now(timezone.utc).isoformat()
@@ -62,7 +77,7 @@ def state():
 @app.post('/api/auth/login')
 def login(x:Login):
     c=db(); u=c.execute('SELECT * FROM users WHERE username=?',(x.username,)).fetchone(); c.close()
-    if not u or not pwd.verify(x.password,u['password_hash']): raise HTTPException(401,'Invalid credentials')
+    if not u or not password_verify(x.password,u['password_hash']): raise HTTPException(401,'Invalid credentials')
     return {'access_token':token({'sub':u['username'],'exp':datetime.now(timezone.utc)+timedelta(hours=24)}),'token_type':'bearer'}
 
 @app.post('/api/devices/pair/start')
