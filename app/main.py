@@ -33,7 +33,7 @@ def password_verify(password: str, stored: str) -> bool:
         return secrets.compare_digest(actual, expected)
     except Exception:
         return False
-app=FastAPI(title='LocalSignage Cloud API', version='2.3.0')
+app=FastAPI(title='LocalSignage Cloud API', version='2.3.1')
 app.mount('/media', StaticFiles(directory=MEDIA_DIR), name='media')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 clients=set()
@@ -93,11 +93,11 @@ def startup(): init_db()
 @app.get('/')
 def root(): return FileResponse(BASE/'app'/'static'/'index.html')
 @app.get('/health')
-def health(): return {'ok':True,'service':'LocalSignage Cloud','version':'2.3.0','time':now(),'timezone':'UTC (display: Africa/Tunis)'}
+def health(): return {'ok':True,'service':'LocalSignage Cloud','version':'2.3.1','time':now(),'timezone':'UTC (display: Africa/Tunis)'}
 @app.get('/api/state')
 def state():
     c=db(); refresh_device_status(c); c.commit(); n=c.execute('SELECT COUNT(*) FROM devices').fetchone()[0]; online=c.execute('SELECT COUNT(*) FROM devices WHERE online=1').fetchone()[0]; c.close()
-    return {'version':'2.3.0','devices':n,'online':online}
+    return {'version':'2.3.1','devices':n,'online':online}
 
 @app.post('/api/auth/login')
 def login(x:Login):
@@ -248,7 +248,7 @@ def player_config(device_id:str, authorization:str=Header(None)):
     elif assignment_type == 'live' and d['live_url']:
         live={'url':d['live_url'],'protocol':d['live_protocol'] or 'auto'}
     c.close()
-    return {'version':'2.3.0','device_id':device_id,'assignment_type':assignment_type,'playlist':dict(p) if p else None,'media':media,'live':live,'items':items,'display_mode':d['display_mode'] or 'fit','orientation':d['orientation'] or 'auto','server_time':now()}
+    return {'version':'2.3.1','device_id':device_id,'assignment_type':assignment_type,'playlist':dict(p) if p else None,'media':media,'live':live,'items':items,'display_mode':d['display_mode'] or 'fit','orientation':d['orientation'] or 'auto','server_time':now()}
 
 class DeviceAssignment(BaseModel):
     type: str = 'none'
