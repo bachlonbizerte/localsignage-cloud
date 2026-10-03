@@ -2,14 +2,17 @@ import os, sqlite3, secrets, hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import jwt
-from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 BASE=Path(__file__).resolve().parent.parent
 DB=Path(os.getenv('DB_PATH', BASE/'data'/'localsignage.db'))
 DB.parent.mkdir(parents=True, exist_ok=True)
+MEDIA_DIR=Path(os.getenv('MEDIA_DIR', BASE/'data'/'media'))
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 SECRET=os.getenv('JWT_SECRET','CHANGE_ME_LOCALSIGNAGE_SECRET')
 ADMIN_USER=os.getenv('ADMIN_USER','admin')
 ADMIN_PASSWORD=os.getenv('ADMIN_PASSWORD','admin123!')
@@ -30,7 +33,8 @@ def password_verify(password: str, stored: str) -> bool:
         return secrets.compare_digest(actual, expected)
     except Exception:
         return False
-app=FastAPI(title='LocalSignage Cloud API', version='2.0.1')
+app=FastAPI(title='LocalSignage Cloud API', version='2.1.0')
+app.mount('/media', StaticFiles(directory=MEDIA_DIR), name='media')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 clients=set()
 
@@ -43,6 +47,9 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS devices(id INTEGER PRIMARY KEY, device_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, platform TEXT, version TEXT, token_hash TEXT, last_seen TEXT, online INTEGER DEFAULT 0, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS pair_codes(id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, expires_at TEXT NOT NULL, used INTEGER DEFAULT 0, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS media(id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, kind TEXT NOT NULL, duration REAL DEFAULT 10, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS playlists(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS playlist_items(id INTEGER PRIMARY KEY, playlist_id INTEGER NOT NULL, media_id INTEGER NOT NULL, position INTEGER NOT NULL, duration REAL DEFAULT 10, FOREIGN KEY(playlist_id) REFERENCES playlists(id) ON DELETE CASCADE, FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE CASCADE);
     ''')
     if not c.execute('SELECT 1 FROM users WHERE username=?',(ADMIN_USER,)).fetchone():
         c.execute('INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)',(ADMIN_USER,password_hash(ADMIN_PASSWORD),now()))
@@ -68,11 +75,11 @@ def startup(): init_db()
 @app.get('/')
 def root(): return FileResponse(BASE/'app'/'static'/'index.html')
 @app.get('/health')
-def health(): return {'ok':True,'service':'LocalSignage Cloud','version':'2.0.0','time':now()}
+def health(): return {'ok':True,'service':'LocalSignage Cloud','version':'2.1.0','time':now()}
 @app.get('/api/state')
 def state():
-    c=db(); n=c.execute('SELECT COUNT(*) FROM devices').fetchone()[0]; online=c.execute('SELECT COUNT(*) FROM devices WHERE online=1').fetchone()[0]; c.close()
-    return {'version':'2.0.0','devices':n,'online':online}
+    c=db(); refresh_device_status(c); c.commit(); n=c.execute('SELECT COUNT(*) FROM devices').fetchone()[0]; online=c.execute('SELECT COUNT(*) FROM devices WHERE online=1').fetchone()[0]; c.close()
+    return {'version':'2.1.0','devices':n,'online':online}
 
 @app.post('/api/auth/login')
 def login(x:Login):
@@ -104,9 +111,117 @@ def heartbeat(x:Heartbeat, authorization:str=Header(None)):
     if not d: c.close(); raise HTTPException(401,'Invalid device token')
     c.execute('UPDATE devices SET version=?,last_seen=?,online=1 WHERE device_id=?',(x.version,now(),x.device_id)); c.commit(); c.close(); return {'ok':True,'server_time':now()}
 
+OFFLINE_AFTER=45
+
+def refresh_device_status(c):
+    cutoff=datetime.now(timezone.utc)-timedelta(seconds=OFFLINE_AFTER)
+    c.execute("UPDATE devices SET online=0 WHERE online=1 AND (last_seen IS NULL OR last_seen < ?)",(cutoff.isoformat(),))
+
 @app.get('/api/devices')
 def devices(_:dict=Depends(auth)):
-    c=db(); rows=[dict(r) for r in c.execute('SELECT id,device_id,name,platform,version,last_seen,online,created_at FROM devices ORDER BY id DESC')]; c.close(); return rows
+    c=db(); refresh_device_status(c); c.commit(); rows=[]
+    for r in c.execute('SELECT id,device_id,name,platform,version,last_seen,online,created_at FROM devices ORDER BY id DESC'):
+        d=dict(r)
+        # Always calculate ONLINE from the heartbeat timestamp so a stale DB flag
+        # can never make an old device appear online.
+        try:
+            seen=datetime.fromisoformat(d['last_seen']) if d.get('last_seen') else None
+            d['online']=bool(seen and (datetime.now(timezone.utc)-seen).total_seconds() <= OFFLINE_AFTER)
+        except Exception:
+            d['online']=False
+        rows.append(d)
+    c.close(); return rows
+
+
+class MediaCreate(BaseModel):
+    name:str
+    url:str
+    kind:str='video'
+    duration:float=10
+
+class PlaylistCreate(BaseModel):
+    name:str
+    media_ids:list[int]=[]
+
+@app.get('/api/media')
+def list_media(_:dict=Depends(auth)):
+    c=db(); rows=[dict(r) for r in c.execute('SELECT * FROM media ORDER BY id DESC')]; c.close(); return rows
+
+@app.post('/api/media')
+def create_media(x:MediaCreate, _:dict=Depends(auth)):
+    if x.kind not in ('video','image','audio'): raise HTTPException(400,'Invalid media kind')
+    c=db(); cur=c.execute('INSERT INTO media(name,url,kind,duration,created_at) VALUES(?,?,?,?,?)',(x.name,x.url,x.kind,max(1,x.duration),now())); c.commit(); mid=cur.lastrowid; row=dict(c.execute('SELECT * FROM media WHERE id=?',(mid,)).fetchone()); c.close(); return row
+
+@app.post('/api/media/upload')
+async def upload_media(file:UploadFile=File(...), name:str=Form(None), kind:str=Form('video'), duration:float=Form(10), _:dict=Depends(auth)):
+    safe=''.join(ch for ch in (file.filename or 'media') if ch.isalnum() or ch in '._-') or 'media'
+    target=MEDIA_DIR/f'{secrets.token_hex(6)}_{safe}'
+    with target.open('wb') as out:
+        while True:
+            chunk=await file.read(1024*1024)
+            if not chunk: break
+            out.write(chunk)
+    url=f'/media/{target.name}'
+    display=name or file.filename or target.name
+    c=db(); cur=c.execute('INSERT INTO media(name,url,kind,duration,created_at) VALUES(?,?,?,?,?)',(display,url,kind,max(1,duration),now())); c.commit(); mid=cur.lastrowid; row=dict(c.execute('SELECT * FROM media WHERE id=?',(mid,)).fetchone()); c.close(); return row
+
+@app.delete('/api/media/{media_id}')
+def delete_media(media_id:int, _:dict=Depends(auth)):
+    c=db(); row=c.execute('SELECT url FROM media WHERE id=?',(media_id,)).fetchone()
+    if not row: c.close(); raise HTTPException(404,'Media not found')
+    if row['url'].startswith('/media/'):
+        try: (MEDIA_DIR/row['url'].split('/media/',1)[1]).unlink(missing_ok=True)
+        except Exception: pass
+    c.execute('DELETE FROM media WHERE id=?',(media_id,)); c.execute('DELETE FROM playlist_items WHERE media_id=?',(media_id,)); c.commit(); c.close(); return {'ok':True}
+
+@app.get('/api/playlists')
+def list_playlists(_:dict=Depends(auth)):
+    c=db(); pls=[]
+    for p in c.execute('SELECT * FROM playlists ORDER BY id DESC'):
+        d=dict(p); d['items']=[dict(r) for r in c.execute('SELECT pi.id,pi.media_id,pi.position,pi.duration,m.name,m.url,m.kind FROM playlist_items pi JOIN media m ON m.id=pi.media_id WHERE pi.playlist_id=? ORDER BY pi.position',(p['id'],))]; pls.append(d)
+    c.close(); return pls
+
+@app.post('/api/playlists')
+def create_playlist(x:PlaylistCreate, _:dict=Depends(auth)):
+    c=db()
+    try:
+        cur=c.execute('INSERT INTO playlists(name,created_at) VALUES(?,?)',(x.name,now())); pid=cur.lastrowid
+        for pos,mid in enumerate(x.media_ids):
+            m=c.execute('SELECT duration FROM media WHERE id=?',(mid,)).fetchone()
+            if m: c.execute('INSERT INTO playlist_items(playlist_id,media_id,position,duration) VALUES(?,?,?,?)',(pid,mid,pos,m['duration']))
+        c.commit()
+    except sqlite3.IntegrityError: c.rollback(); c.close(); raise HTTPException(400,'Playlist name already exists')
+    row=dict(c.execute('SELECT * FROM playlists WHERE id=?',(pid,)).fetchone()); c.close(); return row
+
+@app.put('/api/playlists/{playlist_id}')
+def update_playlist(playlist_id:int, x:PlaylistCreate, _:dict=Depends(auth)):
+    c=db(); p=c.execute('SELECT id FROM playlists WHERE id=?',(playlist_id,)).fetchone()
+    if not p: c.close(); raise HTTPException(404,'Playlist not found')
+    c.execute('UPDATE playlists SET name=? WHERE id=?',(x.name,playlist_id)); c.execute('DELETE FROM playlist_items WHERE playlist_id=?',(playlist_id,))
+    for pos,mid in enumerate(x.media_ids):
+        m=c.execute('SELECT duration FROM media WHERE id=?',(mid,)).fetchone()
+        if m: c.execute('INSERT INTO playlist_items(playlist_id,media_id,position,duration) VALUES(?,?,?,?)',(playlist_id,mid,pos,m['duration']))
+    c.commit(); c.close(); return {'ok':True}
+
+@app.delete('/api/playlists/{playlist_id}')
+def delete_playlist(playlist_id:int, _:dict=Depends(auth)):
+    c=db(); c.execute('DELETE FROM playlist_items WHERE playlist_id=?',(playlist_id,)); c.execute('DELETE FROM playlists WHERE id=?',(playlist_id,)); c.commit(); c.close(); return {'ok':True}
+
+def device_auth(authorization: str=Header(None)):
+    if not authorization or not authorization.startswith('Bearer '): raise HTTPException(401,'Device token required')
+    return authorization[7:]
+
+@app.get('/api/player/config')
+def player_config(device_id:str, authorization:str=Header(None)):
+    t=device_auth(authorization); c=db(); d=c.execute('SELECT * FROM devices WHERE device_id=? AND token_hash=?',(device_id,hash_token(t))).fetchone()
+    if not d: c.close(); raise HTTPException(401,'Invalid device token')
+    refresh_device_status(c)
+    p=c.execute('SELECT * FROM playlists ORDER BY id ASC LIMIT 1').fetchone()
+    items=[]
+    if p:
+        items=[dict(r) for r in c.execute('SELECT pi.id,pi.media_id,pi.position,pi.duration,m.name,m.url,m.kind FROM playlist_items pi JOIN media m ON m.id=pi.media_id WHERE pi.playlist_id=? ORDER BY pi.position',(p['id'],))]
+    c.close()
+    return {'version':'2.1.0','device_id':device_id,'playlist':dict(p) if p else None,'items':items,'server_time':now()}
 
 @app.delete('/api/devices/{device_id}')
 def delete_device(device_id:str, _:dict=Depends(auth)):

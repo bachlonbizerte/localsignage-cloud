@@ -1,36 +1,48 @@
-# LocalSignage Cloud V2.0 Foundation
+# LocalSignage Cloud V2.1
 
-Fondation cloud séparée de LocalSignage V1.22. Ne remplace pas la version locale.
+Fondation cloud + gestion Media/Playlist + Player Android. La V1.22 locale reste indépendante.
 
-## Test gratuit sur Internet avec Render
-1. Créer un compte Render.
-2. Mettre ce dossier dans un dépôt GitHub.
-3. Render → New → Web Service → connecter le dépôt.
-4. Build Command: `pip install -r requirements.txt`
-5. Start Command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-6. Plan: Free.
-7. Ajouter `ADMIN_PASSWORD` dans Environment Variables.
-8. Render donne une URL `https://...onrender.com`.
-9. Ouvrir `/` pour le dashboard ou `/docs` pour Swagger.
+## Ce que V2.1 ajoute
 
-### Important
-Le Free Render est parfait pour le test mais le service peut s'arrêter après 15 min sans trafic et redémarrer avec environ une minute de délai. Le filesystem local est éphémère: cette V2 utilise donc cette SQLite uniquement pour la fondation/test. Pour une vraie production, on passera à PostgreSQL + stockage objet/persistant. Render propose aussi un Postgres gratuit, mais sa durée est limitée à 30 jours. Voir la documentation Render.
+- Dashboard Cloud avec login admin.
+- Pairing Android par code à 6 chiffres.
+- Heartbeat toutes les 20 secondes.
+- Un device passe OFFLINE après 45 secondes sans heartbeat.
+- Bibliothèque Media : URL ou upload de vidéo/image.
+- Playlists avec ordre des médias.
+- API `/api/player/config` consommée par le Player Android.
+- Player Android V2.1 : lit automatiquement la playlist et boucle dessus.
+- Vidéos via Media3/ExoPlayer.
+- Images avec durée configurable.
 
-## Test sans même publier le projet
-Sur ton PC, démarre l'API puis utilise Cloudflare Quick Tunnel:
-`cloudflared tunnel --url http://localhost:8000`
-Cela donne une URL temporaire `trycloudflare.com`. C'est prévu pour développement/test et l'URL cesse de fonctionner quand cloudflared est arrêté.
+## Déploiement Render
 
-## API
-- `POST /api/auth/login`
-- `POST /api/devices/pair/start` (admin)
-- `POST /api/devices/pair` (player)
-- `POST /api/devices/heartbeat` (player token)
-- `GET /api/devices` (admin)
-- `DELETE /api/devices/{device_id}` (admin)
-- `WS /ws/dashboard`
-- `GET /health`
+1. Remplacer le contenu du dépôt GitHub par ce projet.
+2. Render → Web Service → connecter le dépôt.
+3. Build: `pip install -r requirements.txt`
+4. Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+5. Variables: `JWT_SECRET`, `ADMIN_USER`, `ADMIN_PASSWORD`.
 
+### Important pour la production
 
-### V2.0.1 Render
-Cette version utilise PBKDF2-HMAC-SHA256 pour les mots de passe et ne dépend plus de Passlib/bcrypt, afin d’éviter les incompatibilités observées sur Python 3.14 de Render.
+Le plan Render Free et son filesystem local sont adaptés au test, pas au stockage média permanent. Les uploads peuvent disparaître après un redéploiement/restart. Pour la production, utiliser PostgreSQL + stockage objet persistant (S3/R2/Bunny Storage, etc.).
+
+## API Media
+
+- `GET /api/media`
+- `POST /api/media` — JSON URL
+- `POST /api/media/upload` — multipart upload
+- `DELETE /api/media/{id}`
+
+## API Playlist
+
+- `GET /api/playlists`
+- `POST /api/playlists`
+- `PUT /api/playlists/{id}`
+- `DELETE /api/playlists/{id}`
+
+## API Player
+
+- `GET /api/player/config?device_id=...` avec Bearer device token.
+
+Le Player récupère la première playlist et ses médias toutes les 30 secondes.
