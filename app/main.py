@@ -45,12 +45,16 @@ def init_db():
     c=db()
     c.executescript('''
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_hash TEXT NOT NULL, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS devices(id INTEGER PRIMARY KEY, device_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, platform TEXT, version TEXT, token_hash TEXT, last_seen TEXT, online INTEGER DEFAULT 0, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS devices(id INTEGER PRIMARY KEY, device_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, platform TEXT, version TEXT, token_hash TEXT, last_seen TEXT, online INTEGER DEFAULT 0, playlist_id INTEGER, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS pair_codes(id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, expires_at TEXT NOT NULL, used INTEGER DEFAULT 0, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS media(id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, kind TEXT NOT NULL, duration REAL DEFAULT 10, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS playlists(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS playlist_items(id INTEGER PRIMARY KEY, playlist_id INTEGER NOT NULL, media_id INTEGER NOT NULL, position INTEGER NOT NULL, duration REAL DEFAULT 10, FOREIGN KEY(playlist_id) REFERENCES playlists(id) ON DELETE CASCADE, FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE CASCADE);
     ''')
+    # Safe migration for databases created by earlier versions.
+    cols={r['name'] for r in c.execute('PRAGMA table_info(devices)')}
+    if 'playlist_id' not in cols:
+        c.execute('ALTER TABLE devices ADD COLUMN playlist_id INTEGER')
     if not c.execute('SELECT 1 FROM users WHERE username=?',(ADMIN_USER,)).fetchone():
         c.execute('INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)',(ADMIN_USER,password_hash(ADMIN_PASSWORD),now()))
     c.commit(); c.close()
@@ -120,7 +124,7 @@ def refresh_device_status(c):
 @app.get('/api/devices')
 def devices(_:dict=Depends(auth)):
     c=db(); refresh_device_status(c); c.commit(); rows=[]
-    for r in c.execute('SELECT id,device_id,name,platform,version,last_seen,online,created_at FROM devices ORDER BY id DESC'):
+    for r in c.execute('SELECT id,device_id,name,platform,version,last_seen,online,playlist_id,created_at FROM devices ORDER BY id DESC'):
         d=dict(r)
         # Always calculate ONLINE from the heartbeat timestamp so a stale DB flag
         # can never make an old device appear online.
@@ -216,12 +220,29 @@ def player_config(device_id:str, authorization:str=Header(None)):
     t=device_auth(authorization); c=db(); d=c.execute('SELECT * FROM devices WHERE device_id=? AND token_hash=?',(device_id,hash_token(t))).fetchone()
     if not d: c.close(); raise HTTPException(401,'Invalid device token')
     refresh_device_status(c)
-    p=c.execute('SELECT * FROM playlists ORDER BY id ASC LIMIT 1').fetchone()
+    p=None
+    if d['playlist_id'] is not None:
+        p=c.execute('SELECT * FROM playlists WHERE id=?',(d['playlist_id'],)).fetchone()
     items=[]
     if p:
         items=[dict(r) for r in c.execute('SELECT pi.id,pi.media_id,pi.position,pi.duration,m.name,m.url,m.kind FROM playlist_items pi JOIN media m ON m.id=pi.media_id WHERE pi.playlist_id=? ORDER BY pi.position',(p['id'],))]
     c.close()
-    return {'version':'2.1.0','device_id':device_id,'playlist':dict(p) if p else None,'items':items,'server_time':now()}
+    return {'version':'2.1.1','device_id':device_id,'playlist':dict(p) if p else None,'items':items,'server_time':now()}
+
+class DevicePlaylist(BaseModel):
+    playlist_id: int | None = None
+
+@app.put('/api/devices/{device_id}/playlist')
+def assign_device_playlist(device_id:str, x:DevicePlaylist, _:dict=Depends(auth)):
+    c=db()
+    d=c.execute('SELECT id FROM devices WHERE device_id=?',(device_id,)).fetchone()
+    if not d:
+        c.close(); raise HTTPException(404,'Device not found')
+    if x.playlist_id is not None and not c.execute('SELECT id FROM playlists WHERE id=?',(x.playlist_id,)).fetchone():
+        c.close(); raise HTTPException(404,'Playlist not found')
+    c.execute('UPDATE devices SET playlist_id=? WHERE device_id=?',(x.playlist_id,device_id))
+    c.commit(); c.close()
+    return {'ok':True,'device_id':device_id,'playlist_id':x.playlist_id}
 
 @app.delete('/api/devices/{device_id}')
 def delete_device(device_id:str, _:dict=Depends(auth)):
