@@ -1,0 +1,9 @@
+# FIX JDK / Gradle
+
+This version removes the explicit Kotlin JVM toolchain requirement for JDK 17.
+
+The project still targets Java 17 bytecode, but Gradle/Android Studio can use the JDK configured for the IDE instead of trying to download/find a separate JDK 17 toolchain.
+
+If your Android IDE is configured with JDK 17, this is ideal. If Android Studio uses its bundled JBR, select that JDK in Gradle JDK settings.
+
+Build: `./gradlew :app:assembleDebug`
