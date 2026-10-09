@@ -1,6 +1,6 @@
-import os, sqlite3, secrets, hashlib
+import os, sqlite3, secrets, hashlib, re
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import jwt
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
@@ -36,7 +36,7 @@ def password_verify(password: str, stored: str) -> bool:
         return secrets.compare_digest(actual, expected)
     except Exception:
         return False
-app=FastAPI(title='LocalSignage Cloud API', version='2.4.0')
+app=FastAPI(title='LocalSignage Cloud API', version='2.5.0')
 app.mount('/media', StaticFiles(directory=MEDIA_DIR), name='media')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 clients=set()
@@ -50,10 +50,12 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE, email TEXT UNIQUE, name TEXT, password_hash TEXT, google_id TEXT UNIQUE, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS devices(id INTEGER PRIMARY KEY, device_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL, platform TEXT, version TEXT, token_hash TEXT, last_seen TEXT, online INTEGER DEFAULT 0, playlist_id INTEGER, display_mode TEXT DEFAULT 'fit', orientation TEXT DEFAULT 'auto', created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS pair_codes(id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, expires_at TEXT NOT NULL, used INTEGER DEFAULT 0, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS media(id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, kind TEXT NOT NULL, duration REAL DEFAULT 10, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS media(id INTEGER PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, kind TEXT NOT NULL, duration REAL DEFAULT 10, created_at TEXT NOT NULL, folder_path TEXT DEFAULT '');
     CREATE TABLE IF NOT EXISTS playlists(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS playlist_items(id INTEGER PRIMARY KEY, playlist_id INTEGER NOT NULL, media_id INTEGER NOT NULL, position INTEGER NOT NULL, duration REAL DEFAULT 10, FOREIGN KEY(playlist_id) REFERENCES playlists(id) ON DELETE CASCADE, FOREIGN KEY(media_id) REFERENCES media(id) ON DELETE CASCADE);
     ''')
+    mcols={r['name'] for r in c.execute('PRAGMA table_info(media)')}
+    if 'folder_path' not in mcols: c.execute("ALTER TABLE media ADD COLUMN folder_path TEXT DEFAULT ''")
     # Multi-user ownership migration. Existing data is assigned to the existing admin account.
     ucols={r['name'] for r in c.execute('PRAGMA table_info(users)')}
     if 'email' not in ucols: c.execute('ALTER TABLE users ADD COLUMN email TEXT')
@@ -120,11 +122,11 @@ def startup(): init_db()
 @app.get('/')
 def root(): return FileResponse(BASE/'app'/'static'/'index.html')
 @app.get('/health')
-def health(): return {'ok':True,'service':'LocalSignage Cloud','version':'2.4.0','time':now()}
+def health(): return {'ok':True,'service':'LocalSignage Cloud','version':'2.5.0','time':now()}
 @app.get('/api/state')
 def state():
     c=db(); refresh_device_status(c); c.commit(); n=c.execute('SELECT COUNT(*) FROM devices').fetchone()[0]; online=c.execute('SELECT COUNT(*) FROM devices WHERE online=1').fetchone()[0]; c.close()
-    return {'version':'2.4.0','devices':n,'online':online}
+    return {'version':'2.5.0','devices':n,'online':online}
 
 @app.post('/api/auth/signup')
 def signup(x:Signup):
@@ -255,26 +257,102 @@ def create_media(x:MediaCreate, p:dict=Depends(auth)):
     if x.kind not in ('video','image','audio'): raise HTTPException(400,'Invalid media kind')
     c=db(); cur=c.execute('INSERT INTO media(name,url,kind,duration,created_at,owner_user_id) VALUES(?,?,?,?,?,?)',(x.name,x.url,x.kind,max(1,x.duration),now(),uid)); c.commit(); mid=cur.lastrowid; row=dict(c.execute('SELECT * FROM media WHERE id=?',(mid,)).fetchone()); c.close(); return row
 
+def safe_path_parts(relative_path: str):
+    raw = PurePosixPath((relative_path or '').replace('\\', '/'))
+    if raw.is_absolute() or any(part in ('..', '.') for part in raw.parts):
+        raise HTTPException(400, 'Chemin de fichier invalide')
+    parts=[]
+    for part in raw.parts:
+        cleaned=re.sub(r'[^\w .()\-]', '_', part, flags=re.UNICODE).strip(' .')
+        if cleaned and cleaned not in ('.','..'):
+            parts.append(cleaned[:150])
+    if not parts:
+        raise HTTPException(400, 'Nom de fichier invalide')
+    return parts
+
+def media_kind(filename: str):
+    ext=Path(filename).suffix.lower()
+    if ext in ('.jpg','.jpeg','.png','.gif','.webp','.bmp','.svg'): return 'image'
+    if ext in ('.mp3','.wav','.aac','.ogg','.m4a'): return 'audio'
+    return 'video'
+
+async def save_uploaded_media(file: UploadFile, relative_path: str, uid: int, duration: float = 10):
+    parts=safe_path_parts(relative_path or file.filename or 'media')
+    original_name=parts[-1]
+    folder_parts=parts[:-1]
+    # Isolate physical files by account, while preserving their folder hierarchy.
+    folder=MEDIA_DIR / f'user_{uid}'
+    for part in folder_parts:
+        folder=folder / part
+    folder.mkdir(parents=True, exist_ok=True)
+    stem=Path(original_name).stem or 'media'
+    suffix=Path(original_name).suffix[:20]
+    disk_name=f'{stem}__{secrets.token_hex(5)}{suffix}'
+    target=folder/disk_name
+    try:
+        with target.open('wb') as out:
+            while True:
+                chunk=await file.read(1024*1024)
+                if not chunk: break
+                out.write(chunk)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    physical_rel=target.relative_to(MEDIA_DIR).as_posix()
+    from urllib.parse import quote
+    url='/media/'+quote(physical_rel, safe='/')
+    display_path='/'.join(parts)
+    folder_path='/'.join(folder_parts)
+    kind=media_kind(original_name)
+    c=db()
+    cur=c.execute('INSERT INTO media(name,url,kind,duration,created_at,owner_user_id,folder_path) VALUES(?,?,?,?,?,?,?)',
+                  (original_name,url,kind,max(1,duration),now(),uid,folder_path))
+    c.commit(); row=dict(c.execute('SELECT * FROM media WHERE id=?',(cur.lastrowid,)).fetchone()); c.close()
+    row['relative_path']=display_path
+    return row
+
 @app.post('/api/media/upload')
 async def upload_media(file:UploadFile=File(...), name:str=Form(None), kind:str=Form('video'), duration:float=Form(10), p:dict=Depends(auth)):
     uid=owner_id(p)
-    safe=''.join(ch for ch in (file.filename or 'media') if ch.isalnum() or ch in '._-') or 'media'
-    target=MEDIA_DIR/f'{secrets.token_hex(6)}_{safe}'
-    with target.open('wb') as out:
-        while True:
-            chunk=await file.read(1024*1024)
-            if not chunk: break
-            out.write(chunk)
-    url=f'/media/{target.name}'
-    display=name or file.filename or target.name
-    c=db(); cur=c.execute('INSERT INTO media(name,url,kind,duration,created_at,owner_user_id) VALUES(?,?,?,?,?,?)',(display,url,kind,max(1,duration),now(),uid)); c.commit(); mid=cur.lastrowid; row=dict(c.execute('SELECT * FROM media WHERE id=?',(mid,)).fetchone()); c.close(); return row
+    if kind not in ('video','image','audio'): raise HTTPException(400,'Type de média invalide')
+    # Keep the original extension for reliable player format detection; the optional
+    # display name is stored separately in the database.
+    relative=file.filename or name or 'media'
+    row=await save_uploaded_media(file, relative, uid, duration)
+    c=db(); c.execute('UPDATE media SET kind=? WHERE id=? AND owner_user_id=?',(kind,row['id'],uid))
+    if name: c.execute('UPDATE media SET name=? WHERE id=? AND owner_user_id=?',(name,row['id'],uid))
+    c.commit(); c.close(); row['kind']=kind
+    if name: row['name']=name
+    return row
+
+@app.post('/api/media/upload-folder')
+async def upload_media_folder(files: list[UploadFile]=File(...), relative_paths: list[str]=Form(...), duration:float=Form(10), p:dict=Depends(auth)):
+    uid=owner_id(p)
+    if not files: raise HTTPException(400,'Aucun fichier sélectionné')
+    if len(files) != len(relative_paths): raise HTTPException(400,'Liste des chemins invalide')
+    if len(files) > 2000: raise HTTPException(413,'Maximum 2000 fichiers par envoi')
+    saved=[]; errors=[]
+    for file, rel in zip(files, relative_paths):
+        try:
+            saved.append(await save_uploaded_media(file, rel or file.filename or 'media', uid, duration))
+        except HTTPException as e:
+            errors.append({'file': rel, 'error': str(e.detail)})
+        except Exception:
+            errors.append({'file': rel, 'error': 'Échec de téléversement'})
+        finally:
+            await file.close()
+    return {'ok':len(saved)>0,'uploaded':len(saved),'failed':len(errors),'items':saved,'errors':errors}
 
 @app.delete('/api/media/{media_id}')
 def delete_media(media_id:int, p:dict=Depends(auth)):
     uid=owner_id(p); c=db(); row=c.execute('SELECT url FROM media WHERE id=? AND owner_user_id=?',(media_id,uid)).fetchone()
     if not row: c.close(); raise HTTPException(404,'Media not found')
     if row['url'].startswith('/media/'):
-        try: (MEDIA_DIR/row['url'].split('/media/',1)[1]).unlink(missing_ok=True)
+        try:
+            from urllib.parse import unquote
+            relative=Path(unquote(row['url'].split('/media/',1)[1]))
+            target=(MEDIA_DIR/relative).resolve()
+            if target.is_relative_to(MEDIA_DIR.resolve()): target.unlink(missing_ok=True)
         except Exception: pass
     c.execute('DELETE FROM media WHERE id=?',(media_id,)); c.execute('DELETE FROM playlist_items WHERE media_id=?',(media_id,)); c.commit(); c.close(); return {'ok':True}
 
@@ -334,7 +412,7 @@ def player_config(device_id:str, authorization:str=Header(None)):
     elif assignment_type == 'live' and d['live_url']:
         live={'url':d['live_url'],'protocol':d['live_protocol'] or 'auto'}
     c.close()
-    return {'version':'2.4.0','device_id':device_id,'assignment_type':assignment_type,'playlist':dict(p) if p else None,'media':media,'live':live,'items':items,'display_mode':d['display_mode'] or 'fit','orientation':d['orientation'] or 'auto','server_time':now()}
+    return {'version':'2.5.0','device_id':device_id,'assignment_type':assignment_type,'playlist':dict(p) if p else None,'media':media,'live':live,'items':items,'display_mode':d['display_mode'] or 'fit','orientation':d['orientation'] or 'auto','server_time':now()}
 
 class DeviceAssignment(BaseModel):
     type: str = 'none'
